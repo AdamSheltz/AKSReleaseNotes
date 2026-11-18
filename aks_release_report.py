@@ -15,6 +15,13 @@ Usage:
   python aks_release_report.py --out-root C:\\Reports  # writes C:\\Reports\\<yyyymmdd>\\
   python aks_release_report.py --teams-webhook https://...   # also post summary to Teams
   python aks_release_report.py --github-token ghp_xxx        # optional, raises rate limit
+  python aks_release_report.py --search CVE --search "node image"      # highlight terms in the HTML report
+  python aks_release_report.py --days 14 --search cilium --search-only  # only releases that match
+
+Search: --search is case-insensitive and can be repeated. Matches are highlighted
+in the HTML report (component, title, tag, CVEs, summary) and every matching line
+from the full release notes is listed under each release, even when it falls
+outside the 12-line summary. Wrap a term in slashes for a regex: --search "/CVE-2026-\\d+/"
 
 Teams: create the webhook with the Teams "Workflows" app
 ("Post to a channel when a webhook request is received") and pass its URL.
@@ -65,6 +72,61 @@ FLAGS = {
 }
 
 
+def compile_search(terms):
+    """Build one case-insensitive regex from --search terms (/.../ = raw regex)."""
+    parts = []
+    for t in terms or []:
+        t = t.strip()
+        if not t:
+            continue
+        if len(t) > 2 and t.startswith("/") and t.endswith("/"):
+            parts.append(t[1:-1])
+        else:
+            parts.append(re.escape(t))
+    if not parts:
+        return None
+    # Longest first so "node image" wins over "node" when both are given.
+    parts.sort(key=len, reverse=True)
+    return re.compile("|".join(f"(?:{x})" for x in parts), re.IGNORECASE)
+
+
+def highlight(text, rx):
+    """HTML-escape text and wrap each search match in <mark>."""
+    text = text or ""
+    if not rx:
+        return html.escape(text)
+    out, last = [], 0
+    for m in rx.finditer(text):
+        if m.start() == m.end():
+            continue
+        out.append(html.escape(text[last:m.start()]))
+        out.append(f"<mark>{html.escape(m.group(0))}</mark>")
+        last = m.end()
+    out.append(html.escape(text[last:]))
+    return "".join(out)
+
+
+def apply_search(results, rx, max_lines=15):
+    """Annotate each release with its match count and matching lines from the full notes."""
+    for _, _, items, _ in results:
+        for i in items:
+            if not rx:
+                i["matches"], i["match_lines"] = 0, []
+                continue
+            haystack = "\n".join([i["title"], i["tag"], i["body"]])
+            i["matches"] = sum(1 for m in rx.finditer(haystack) if m.group(0))
+            lines = [l.strip() for l in i["body"].splitlines() if l.strip() and rx.search(l)]
+            i["match_lines"] = lines[:max_lines] + (
+                [f"... ({len(lines) - max_lines} more matching lines - see full notes)"]
+                if len(lines) > max_lines else [])
+    return results
+
+
+def filter_matches(results):
+    """Keep only releases that matched the search."""
+    return [(k, repo, [i for i in items if i["matches"]], err) for k, repo, items, err in results]
+
+
 def strip_html(s):
     s = re.sub(r"(?is)<(script|style).*?</\1>", "", s or "")
     s = re.sub(r"(?i)<br\s*/?>|</p>|</li>|</h\d>", "\n", s)
@@ -103,7 +165,7 @@ def fetch_feed(key, repo, token, cutoff, include_pre):
         items.append({
             "title": title, "tag": tag, "link": link, "date": when,
             "prerelease": is_pre, "flags": flags,
-            "summary": summarize(body),
+            "summary": summarize(body), "body": body,
             "cves": sorted(set(re.findall(r"CVE-\d{4}-\d{4,7}", body))),
         })
     items.sort(key=lambda i: i["date"], reverse=True)
@@ -121,12 +183,14 @@ def summarize(body, max_lines=12):
     return out
 
 
-def build_markdown(results, days, now):
+def build_markdown(results, days, now, terms=None):
     total = sum(len(r[2]) for r in results)
     md = [f"# AKS Component Release Report",
           f"_Window: last {days} days (since {(now - dt.timedelta(days=days)):%Y-%m-%d %H:%M} UTC) - "
           f"generated {now:%Y-%m-%d %H:%M} UTC_", "",
           f"**{total} release(s) across {sum(1 for r in results if r[2])} component(s).**", "",
+          *([f"**Search:** {', '.join(terms)} - "
+             f"{sum(1 for r in results for i in r[2] if i.get('matches'))} matching release(s)", ""] if terms else []),
           "| Category | Component | Releases | Flags |", "|---|---|---|---|"]
     for (cat, comp), repo, items, err in results:
         if items:
@@ -142,45 +206,78 @@ def build_markdown(results, days, now):
             md += ["", f"## {comp} - {i['title']}",
                    f"[{i['tag']}]({i['link']}) - {i['date']:%Y-%m-%d %H:%M} UTC"
                    + (" - **pre-release**" if i["prerelease"] else "")
-                   + (f" - flags: {', '.join(i['flags'])}" if i["flags"] else "")]
+                   + (f" - flags: {', '.join(i['flags'])}" if i["flags"] else "")
+                   + (f" - **{i['matches']} search match(es)**" if i.get("matches") else "")]
             if i["cves"]:
                 md.append(f"CVEs: {', '.join(i['cves'])}")
             md += [""] + [f"> {l}" for l in i["summary"]]
+            if i.get("match_lines"):
+                md += ["", "Matching lines:"] + [f"- {l}" for l in i["match_lines"]]
     return "\n".join(md)
 
 
-def build_html(results, days, now):
+def build_html(results, days, now, rx=None, terms=None, search_only=False):
     total = sum(len(r[2]) for r in results)
+    hits = sum(1 for r in results for i in r[2] if i.get("matches"))
     color = {"Breaking": "#c62828", "Security": "#ef6c00", "AKS/Azure": "#0078d4"}
     def badge(f): return f'<span style="background:{color[f]};color:#fff;border-radius:4px;padding:1px 6px;font-size:11px;margin-right:4px">{f}</span>'
+    def match_badge(n): return (f'<span class="hit">&#128269; {n} match{"es" if n != 1 else ""}</span>' if n else "")
+    anchor = 0
     rows, details = [], []
     for (cat, comp), repo, items, err in results:
         if not items:
             continue
         flags = sorted({f for i in items for f in i["flags"]})
-        tag_links = [f"<a href='{i['link']}'>{html.escape(i['tag'])}</a>" for i in items]
-        rows.append(f"<tr><td>{cat}</td><td><a href='https://github.com/{repo}/releases'>{html.escape(comp)}</a></td>"
+        tag_links = []
+        comp_hits = 0
+        for i in items:
+            anchor += 1
+            i["_anchor"] = f"r{anchor}"
+            comp_hits += i.get("matches", 0)
+            tag_links.append(f"<a href='#{i['_anchor']}'>{highlight(i['tag'], rx)}</a>"
+                             + (" &#128269;" if i.get("matches") else ""))
+        rows.append(f"<tr{' class=hitrow' if comp_hits else ''}><td>{html.escape(cat)}</td>"
+                    f"<td><a href='https://github.com/{repo}/releases'>{highlight(comp, rx)}</a></td>"
                     f"<td>{'<br>'.join(tag_links)}</td>"
-                    f"<td>{''.join(badge(f) for f in flags)}</td></tr>")
+                    f"<td>{''.join(badge(f) for f in flags)}{match_badge(comp_hits)}</td></tr>")
         for i in items:
             details.append(
-                f"<h3>{html.escape(comp)} &mdash; {html.escape(i['title'])}</h3>"
-                f"<p><a href='{i['link']}'>{html.escape(i['tag'])}</a> &middot; {i['date']:%Y-%m-%d %H:%M} UTC "
+                f"<div class='rel{' hitrel' if i.get('matches') else ''}' id='{i['_anchor']}'>"
+                f"<h3>{highlight(comp, rx)} &mdash; {highlight(i['title'], rx)}</h3>"
+                f"<p><a href='{i['link']}'>{highlight(i['tag'], rx)}</a> &middot; {i['date']:%Y-%m-%d %H:%M} UTC "
                 + ("&middot; <b>pre-release</b> " if i["prerelease"] else "")
-                + "".join(badge(f) for f in i["flags"]) + "</p>"
-                + (f"<p><b>CVEs:</b> {', '.join(i['cves'])}</p>" if i["cves"] else "")
-                + "<pre style='white-space:pre-wrap;background:#f6f8fa;padding:8px;border-radius:6px'>"
-                + html.escape("\n".join(i["summary"])) + "</pre>")
+                + "".join(badge(f) for f in i["flags"]) + match_badge(i.get("matches", 0)) + "</p>"
+                + (f"<p><b>CVEs:</b> {highlight(', '.join(i['cves']), rx)}</p>" if i["cves"] else "")
+                + "<pre>" + highlight("\n".join(i["summary"]), rx) + "</pre>"
+                + (("<p><b>Matching lines in full release notes:</b></p><pre class='hits'>"
+                    + highlight("\n".join(i["match_lines"]), rx) + "</pre>") if i.get("match_lines") else "")
+                + "</div>")
     quiet = [k[1] for k, _, items, err in results if not items and not err]
     errs = [(k[1], err) for k, _, items, err in results if err]
+    search_html = ""
+    if terms:
+        search_html = ("<p class='searchbox'><b>Search:</b> "
+                       + ", ".join(f"<mark>{html.escape(t)}</mark>" for t in terms)
+                       + f" &middot; <b>{hits}</b> of {total} release(s) match"
+                       + (" (showing matching releases only)" if search_only else "") + "</p>")
+    empty = "No matching releases in window" if search_only else "No releases in window"
     return f"""<!doctype html><html><head><meta charset="utf-8"><title>AKS Component Release Report</title>
 <style>body{{font-family:Segoe UI,Arial,sans-serif;max-width:1000px;margin:24px auto;color:#222}}
 table{{border-collapse:collapse;width:100%}}td,th{{border:1px solid #ddd;padding:6px;vertical-align:top}}
-th{{background:#0078d4;color:#fff;text-align:left}}</style></head><body>
+th{{background:#0078d4;color:#fff;text-align:left}}
+pre{{white-space:pre-wrap;background:#f6f8fa;padding:8px;border-radius:6px}}
+pre.hits{{background:#fffde7;border-left:4px solid #fbc02d}}
+mark{{background:#ffeb3b;color:#000;padding:0 2px;border-radius:2px}}
+.hit{{background:#fbc02d;color:#000;border-radius:4px;padding:1px 6px;font-size:11px;margin-right:4px}}
+tr.hitrow td{{background:#fffde7}}
+.hitrel{{border-left:4px solid #fbc02d;padding-left:10px}}
+.searchbox{{background:#fffde7;border:1px solid #fbc02d;border-radius:6px;padding:8px 12px}}
+</style></head><body>
 <h1>AKS Component Release Report</h1>
 <p>Last {days} days (since {(now - dt.timedelta(days=days)):%Y-%m-%d %H:%M} UTC) &middot; generated {now:%Y-%m-%d %H:%M} UTC</p>
+{search_html}
 <p><b>{total} release(s)</b> across {len(rows)} component(s).</p>
-<table><tr><th>Category</th><th>Component</th><th>Releases</th><th>Flags</th></tr>{''.join(rows) or '<tr><td colspan=4>No releases in window</td></tr>'}</table>
+<table><tr><th>Category</th><th>Component</th><th>Releases</th><th>Flags</th></tr>{''.join(rows) or f'<tr><td colspan=4>{empty}</td></tr>'}</table>
 <p><b>No releases:</b> {html.escape(', '.join(quiet)) or 'none'}</p>
 {('<p><b>Could not read:</b> ' + html.escape('; '.join(f'{c} ({e})' for c, e in errs)) + '</p>') if errs else ''}
 <h2>Details</h2>{''.join(details)}</body></html>"""
@@ -216,24 +313,41 @@ def main():
     p.add_argument("--out", default="aks_release_report", help="output file name prefix")
     p.add_argument("--teams-webhook", default=os.getenv("TEAMS_WEBHOOK_URL"))
     p.add_argument("--github-token", default=os.getenv("GITHUB_TOKEN"))
+    p.add_argument("--search", action="append", default=[], metavar="TERM",
+                   help="term to highlight in the HTML report (case-insensitive, repeatable; /regex/ allowed)")
+    p.add_argument("--search-only", action="store_true",
+                   help="with --search, only include releases that match")
     a = p.parse_args()
+    if a.search_only and not a.search:
+        p.error("--search-only requires --search")
+    try:
+        rx = compile_search(a.search)
+    except re.error as e:
+        p.error(f"invalid --search regex: {e}")
 
     now = dt.datetime.now(dt.timezone.utc)
     cutoff = now - dt.timedelta(days=a.days)
     with ThreadPoolExecutor(max_workers=8) as ex:
         results = list(ex.map(lambda kv: fetch_feed(kv[0], kv[1], a.github_token, cutoff, a.include_prerelease),
                               FEEDS.items()))
+    apply_search(results, rx)
+    if rx and a.search_only:
+        results = filter_matches(results)
 
     out_dir = os.path.join(a.out_root, dt.datetime.now().strftime("%Y%m%d"))
     os.makedirs(out_dir, exist_ok=True)
     base = os.path.join(out_dir, a.out)
-    md, page = build_markdown(results, a.days, now), build_html(results, a.days, now)
+    md = build_markdown(results, a.days, now, a.search)
+    page = build_html(results, a.days, now, rx, a.search, a.search_only)
     with open(f"{base}.md", "w", encoding="utf-8") as f:
         f.write(md)
     with open(f"{base}.html", "w", encoding="utf-8") as f:
         f.write(page)
     total = sum(len(r[2]) for r in results)
     print(f"{total} release(s) in last {a.days} days -> {base}.html, {base}.md")
+    if rx:
+        hits = sum(1 for r in results for i in r[2] if i["matches"])
+        print(f"Search {a.search}: {hits} matching release(s)")
     for k, repo, items, err in results:
         if err:
             print(f"  WARN {k[1]}: {err}", file=sys.stderr)
